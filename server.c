@@ -1,21 +1,24 @@
 /*
- * socket.c — управляющий модуль: main(), приём соединений, работа с сокетами.
+ * server.c — библиотека сервера: server_run(), приём соединений, сокеты.
+ *
+ * Это НЕ программа: функции main() здесь нет. Код компонуется с main.c
+ * пользователя на этапе сборки (см. Makefile: libcgi-server.a), а CGI-функцию
+ * библиотека получает от него обычным указателем — аргументом server_run().
  *
  * Путь одного запроса:
  *
- *   main() -> accept() -> thread_pool_push()            главный поток
- *                              |
- *                              v  очередь пула
- *   socket_client()                                     рабочий поток
+ *   server_run() -> accept() -> thread_pool_push()      главный поток
+ *                                    |
+ *                                    v  очередь пула
+ *   socket_client()                                       рабочий поток
  *     1. socket_read_request()  — читаем «голые» данные клиента
- *     2. import_call()          — вызываем CGI-функцию через указатель,
+ *     2. server->cgi(...)       — вызываем CGI-функцию через указатель,
  *                                 передавая ей root (256 символов) и данные
  *     3. socket_close()         — закрываем соединение
  */
 #define _XOPEN_SOURCE 700 /* POSIX.1-2008 + XSI: realpath(), SA_RESETHAND */
 
-#include "socket.h"
-#include "import.h"
+#include "server.h"
 #include "thread.h"
 
 #include <arpa/inet.h>
@@ -48,11 +51,12 @@
 /* Настройки и общее состояние сервера. Указатель на эту структуру получает
  * каждый рабочий поток (аргумент arg обработчика socket_client). */
 typedef struct {
-    char         root[CGI_ROOT_SIZE]; /* корневая папка — передаётся в CGI */
-    cgi_import_t cgi;                 /* импортированная CGI-функция */
-    size_t       max_request;         /* предельный размер запроса, байт */
-    int          timeout_ms;          /* таймаут чтения запроса и записи ответа */
-    int          quiet;               /* 1 — не печатать журнал запросов */
+    char           root[CGI_ROOT_SIZE]; /* корневая папка — передаётся в CGI */
+    cgi_function_t cgi;                 /* указатель на CGI-функцию (ее адрес
+                                           передала программа в server_run()) */
+    size_t         max_request;         /* предельный размер запроса, байт */
+    int            timeout_ms;          /* таймаут чтения запроса и записи ответа */
+    int            quiet;               /* 1 — не печатать журнал запросов */
 } server_t;
 
 /* Флаг остановки: его выставляет обработчик SIGINT/SIGTERM. */
@@ -564,9 +568,12 @@ static void socket_client(int client, void *arg)
         /* Копируем все 256 байт root: CGI может менять свой буфер,
          * никак не влияя на другие потоки. */
         memcpy(root, server->root, CGI_ROOT_SIZE);
+        root[CGI_ROOT_SIZE - 1] = '\0'; /* строка гарантированно заканчивается в буфере */
 
-        /* Вызов CGI-функции через указатель, полученный в import.c. */
-        status = import_call(&server->cgi, root, data, size, client);
+        /* Вызов CGI-функции через указатель, переданный в server_run().
+         * Адрес известен уже на этапе компоновки программы — никакой
+         * динамической загрузки во время работы. */
+        status = server->cgi(root, data, size, client);
         if (status < 0) { /* CGI сообщила, что ответ не отправлен */
             socket_send_status(client, 500);
             status = 500;
@@ -584,13 +591,13 @@ static void socket_client(int client, void *arg)
 }
 
 /* ======================================================================== */
-/* main()                                                                   */
+/* server_run()                                                             */
 /* ======================================================================== */
 
 static void on_signal(int sig)
 {
     static const char msg[] =
-        "\ncgi-server: остановка... (повторный Ctrl+C — выйти немедленно)\n";
+        "\nserver: остановка... (повторный Ctrl+C — выйти немедленно)\n";
     ssize_t ignored;
 
     (void)sig;
@@ -629,18 +636,18 @@ static int set_root(char *root, const char *path)
     size_t      len;
 
     if (full == NULL) {
-        fprintf(stderr, "cgi-server: корневая папка %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "server: корневая папка %s: %s\n", path, strerror(errno));
         return -1;
     }
     len = strlen(full);
 
     if (stat(full, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        fprintf(stderr, "cgi-server: %s — не папка\n", full);
+        fprintf(stderr, "server: %s — не папка\n", full);
         free(full);
         return -1;
     }
     if (len >= CGI_ROOT_SIZE) {
-        fprintf(stderr, "cgi-server: путь к корню длиннее %d символов: %s\n",
+        fprintf(stderr, "server: путь к корню длиннее %d символов: %s\n",
                 CGI_ROOT_SIZE - 1, full);
         free(full);
         return -1;
@@ -674,21 +681,18 @@ static void usage(FILE *out, const char *prog)
             "  -p PORT   порт (по умолчанию %s)\n"
             "  -a ADDR   адрес для прослушивания (по умолчанию %s; IPv6 — ::)\n"
             "  -r ROOT   корневая папка, передаётся в CGI как root (по умолчанию %s)\n"
-            "  -l LIB    CGI-библиотека .so (по умолчанию %s)\n"
-            "  -f NAME   имя CGI-функции в библиотеке (по умолчанию %s)\n"
             "  -t N      число рабочих потоков (по умолчанию %d)\n"
             "  -m BYTES  максимальный размер запроса в байтах (по умолчанию %d)\n"
             "  -T SEC    таймаут чтения запроса и записи ответа (по умолчанию %d)\n"
             "  -q        не печатать журнал запросов\n"
             "  -h        показать эту справку\n",
-            prog, SOCKET_DEFAULT_PORT, SOCKET_DEFAULT_ADDRESS, SOCKET_DEFAULT_ROOT,
-            SOCKET_DEFAULT_LIBRARY, CGI_FUNCTION_NAME, SOCKET_DEFAULT_THREADS,
-            SOCKET_DEFAULT_MAX, SOCKET_DEFAULT_TIMEOUT);
+            prog, SERVER_DEFAULT_PORT, SERVER_DEFAULT_ADDRESS, SERVER_DEFAULT_ROOT,
+            SERVER_DEFAULT_THREADS, SERVER_DEFAULT_MAX, SERVER_DEFAULT_TIMEOUT);
 }
 
 static int bad_option(int opt, const char *value, const char *range)
 {
-    fprintf(stderr, "cgi-server: неверное значение -%c %s (нужно %s)\n", opt, value, range);
+    fprintf(stderr, "server: неверное значение -%c %s (нужно %s)\n", opt, value, range);
     return 2;
 }
 
@@ -706,7 +710,7 @@ static void accept_loop(int listener, thread_pool_t *pool, const server_t *serve
         pfd.revents = 0;
         ready = poll(&pfd, 1, 1000);
         if (ready < 0 && errno != EINTR) {
-            perror("cgi-server: poll");
+            perror("server: poll");
             break;
         }
         if (ready <= 0)
@@ -731,24 +735,33 @@ static void accept_loop(int listener, thread_pool_t *pool, const server_t *serve
     }
 }
 
-int main(int argc, char **argv)
+/*
+ * Точка входа библиотеки: её вызывает main() пользовательской программы
+ * (см. example/main.c). CGI-функцию сервер получает готовым указателем —
+ * её код скомпонован с сервером в одну программу. Блокируется до остановки
+ * сервера, поэтому обычно её результат сразу возвращается из main().
+ */
+int server_run(cgi_function_t cgi, int argc, char **argv)
 {
     static server_t server; /* static — значит, обнулена при запуске */
-    const char     *address  = SOCKET_DEFAULT_ADDRESS;
-    const char     *port     = SOCKET_DEFAULT_PORT;
-    const char     *root     = SOCKET_DEFAULT_ROOT;
-    const char     *library  = SOCKET_DEFAULT_LIBRARY;
-    const char     *function = CGI_FUNCTION_NAME;
+    const char     *address  = SERVER_DEFAULT_ADDRESS;
+    const char     *port     = SERVER_DEFAULT_PORT;
+    const char     *root     = SERVER_DEFAULT_ROOT;
     const char     *host;
-    long            threads  = SOCKET_DEFAULT_THREADS;
-    long            max      = SOCKET_DEFAULT_MAX;
-    long            timeout  = SOCKET_DEFAULT_TIMEOUT;
+    long            threads  = SERVER_DEFAULT_THREADS;
+    long            max      = SERVER_DEFAULT_MAX;
+    long            timeout  = SERVER_DEFAULT_TIMEOUT;
     long            number;
     thread_pool_t  *pool;
     int             listener, opt;
 
+    if (cgi == NULL) {
+        fprintf(stderr, "server: server_run() получила NULL вместо CGI-функции\n");
+        return 1;
+    }
+
     /* ---- 1. Ключи командной строки ---- */
-    while ((opt = getopt(argc, argv, "p:a:r:l:f:t:m:T:qh")) != -1) {
+    while ((opt = getopt(argc, argv, "p:a:r:t:m:T:qh")) != -1) {
         switch (opt) {
         case 'p':
             if (parse_number(optarg, 1, 65535, &number) != 0)
@@ -757,8 +770,6 @@ int main(int argc, char **argv)
             break;
         case 'a': address  = optarg; break;
         case 'r': root     = optarg; break;
-        case 'l': library  = optarg; break;
-        case 'f': function = optarg; break;
         case 't':
             if (parse_number(optarg, 1, 1024, &threads) != 0)
                 return bad_option(opt, optarg, "1..1024");
@@ -777,13 +788,14 @@ int main(int argc, char **argv)
         }
     }
     if (optind < argc) {
-        fprintf(stderr, "cgi-server: лишний аргумент: %s\n", argv[optind]);
+        fprintf(stderr, "server: лишний аргумент: %s\n", argv[optind]);
         usage(stderr, argv[0]);
         return 2;
     }
 
     setvbuf(stdout, NULL, _IOLBF, 0); /* журнал — построчно, даже в файл */
     tzset();
+    server.cgi         = cgi; /* указатель на CGI-функцию — от программы */
     server.max_request = (size_t)max;
     server.timeout_ms  = (int)timeout * 1000;
 
@@ -791,44 +803,35 @@ int main(int argc, char **argv)
     if (set_root(server.root, root) != 0)
         return 1;
 
-    /* ---- 3. Импорт CGI-функции: dlopen + dlsym -> указатель на функцию ---- */
-    if (import_library(&server.cgi, library, function) != 0)
-        return 1;
-
-    /* ---- 4. Сигналы и слушающий сокет ---- */
+    /* ---- 3. Сигналы и слушающий сокет ---- */
     setup_signals();
     listener = socket_listen(address, port);
-    if (listener < 0) {
-        import_close(&server.cgi);
+    if (listener < 0)
         return 1;
-    }
 
-    /* ---- 5. Пул потоков: каждый поток вызывает socket_client() ---- */
-    pool = thread_pool_create((size_t)threads, SOCKET_QUEUE_SIZE, socket_client, &server);
+    /* ---- 4. Пул потоков: каждый поток вызывает socket_client() ---- */
+    pool = thread_pool_create((size_t)threads, SERVER_QUEUE_SIZE, socket_client, &server);
     if (pool == NULL) {
-        fprintf(stderr, "cgi-server: не удалось запустить рабочие потоки\n");
+        fprintf(stderr, "server: не удалось запустить рабочие потоки\n");
         close(listener);
-        import_close(&server.cgi);
         return 1;
     }
 
     host = address;
     if (strcmp(address, "0.0.0.0") == 0 || strcmp(address, "::") == 0)
         host = "localhost";
-    printf("cgi-server: CGI-функция %s() импортирована из %s\n", function, library);
-    printf("cgi-server: root = %s\n", server.root);
-    printf("cgi-server: рабочих потоков: %ld, слушаю %s, порт %s\n", threads, address, port);
-    printf("cgi-server: откройте http://%s%s%s:%s/  (Ctrl+C — остановка)\n",
+    printf("server: root = %s\n", server.root);
+    printf("server: рабочих потоков: %ld, слушаю %s, порт %s\n", threads, address, port);
+    printf("server: откройте http://%s%s%s:%s/  (Ctrl+C — остановка)\n",
            strchr(host, ':') ? "[" : "", host, strchr(host, ':') ? "]" : "", port);
 
-    /* ---- 6. Главный цикл ---- */
+    /* ---- 5. Главный цикл ---- */
     accept_loop(listener, pool, &server);
 
-    /* ---- 7. Остановка: не принимаем новые соединения, дожидаемся
-     *         текущих запросов и только потом выгружаем CGI ---- */
+    /* ---- 6. Остановка: не принимаем новые соединения и дожидаемся
+     *         текущих запросов ---- */
     close(listener);
     thread_pool_destroy(pool);
-    import_close(&server.cgi);
-    printf("cgi-server: остановлен\n");
+    printf("server: остановлен\n");
     return 0;
 }

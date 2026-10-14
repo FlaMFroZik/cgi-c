@@ -1,19 +1,28 @@
 /*
- * example/main.c — пример CGI для cgi-server.
+ * example/main.c — пример программы: своя CGI плюс сервер-библиотека.
+ *
+ * Сервер здесь — библиотека (server.c + thread.c собираются в
+ * libcgi-server.a), которая компонуется с этим файлом в одну программу
+ * example/server на этапе сборки. Никакой динамической загрузки (.so,
+ * dlopen/dlsym) — CGI-функцию сервер получает обычным указателем.
  *
  * В этом файле вместе находятся CGI-функция и функция main:
  *
- *   cgi_main()  CGI-функция. Makefile собирает файл в библиотеку
- *               example/cgi.so; сервер импортирует из неё cgi_main
- *               (dlopen + dlsym -> указатель на функцию) и вызывает её
- *               для каждого запроса в одном из рабочих потоков.
+ *   cgi_main()  CGI-функция. main() передаёт её адрес в server_run(), и
+ *               дальше сервер вызывает её через указатель для каждого
+ *               запроса в одном из рабочих потоков.
  *
- *   main()      обычная точка входа. Makefile собирает этот же файл
- *               и как программу example/cgi: она читает «голые» данные
- *               запроса из stdin, вызывает cgi_main() и печатает ответ
- *               в stdout. Так CGI можно проверить вообще без сервера:
+ *   main()      точка входа программы. В обычном запуске она просто отдаёт
+ *               CGI-функцию серверу:
  *
- *                 printf 'GET /echo HTTP/1.1\r\nHost: x\r\n\r\n' | ./example/cgi .
+ *                 ./example/server -p 8080 -r .
+ *
+ *               А если первый аргумент — "-", программа работает без сети:
+ *               читает «голые» данные запроса из stdin, вызывает cgi_main()
+ *               и печатает ответ в stdout. Так CGI можно проверить вообще
+ *               без сервера:
+ *
+ *                 printf 'GET /echo HTTP/1.1\r\nHost: x\r\n\r\n' | ./example/server - .
  *
  * Что отвечает пример:
  *
@@ -26,7 +35,7 @@
  */
 #define _XOPEN_SOURCE 700 /* POSIX.1-2008 + XSI: realpath(), scandir() */
 
-#include "../import.h" /* CGI_ROOT_SIZE и тип cgi_function_t */
+#include "../server.h" /* CGI_ROOT_SIZE, тип cgi_function_t, server_run() */
 
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -43,7 +52,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-/* CGI-функция. Её тип в точности совпадает с cgi_function_t из import.h. */
+/* CGI-функция. Её тип в точности совпадает с cgi_function_t из server.h. */
 int cgi_main(char *root, char *data, size_t size, int client);
 
 #define SHOW_MAX (64 * 1024) /* сколько сырых данных показывать на странице */
@@ -562,8 +571,10 @@ static int info_page(int client, const char *root, const char *data, size_t size
     text_str(&page, PAGE_HEAD);
     text_str(&page,
              "<p>Эту страницу собрала функция <code>cgi_main()</code> из "
-             "<code>example/main.c</code>. Сервер импортировал её из <code>example/cgi.so</code> "
-             "(dlopen + dlsym) и вызвал через указатель на функцию в рабочем потоке.</p>\n");
+             "<code>example/main.c</code>. Код сервера скомпонован с ней в одну программу "
+             "(библиотека <code>libcgi-server.a</code>): <code>main()</code> передала её адрес "
+             "в <code>server_run()</code>, и сервер вызвал CGI через указатель на функцию "
+             "в рабочем потоке.</p>\n");
 
     /* --- аргументы --- */
     text_str(&page, "<h2>Аргументы CGI-функции</h2>\n<table>\n");
@@ -783,36 +794,26 @@ int cgi_main(char *root, char *data, size_t size, int client)
 }
 
 /* ======================================================================== */
-/* main() — запуск той же CGI без сервера                                   */
+/* Режим без сети: один запрос из stdin, ответ — в stdout                   */
 /* ======================================================================== */
 
 /*
- * ./example/cgi [ROOT] < запрос
- *
  * Делает то же, что сервер для одного запроса: готовит буфер root на
  * 256 символов, читает «голые» данные (здесь — из stdin) и вызывает
  * CGI-функцию через указатель. Ответ пишется в stdout (дескриптор 1).
  */
-int main(int argc, char **argv)
+static int run_once(const char *root_arg)
 {
     char           root[CGI_ROOT_SIZE]; /* тот самый буфер на 256 символов */
-    cgi_function_t cgi = cgi_main;      /* указатель на функцию — как в сервере */
+    cgi_function_t cgi = cgi_main;      /* указатель на функцию — как в server_run() */
     char          *full, *data = NULL;
     size_t         size = 0, cap = 0, len;
     int            status;
 
-    if (argc > 2 || (argc == 2 && argv[1][0] == '-')) {
-        fprintf(stderr,
-                "Использование: %s [ROOT] < запрос\n"
-                "Пример: printf 'GET / HTTP/1.1\\r\\n\\r\\n' | %s .\n",
-                argv[0], argv[0]);
-        return 2;
-    }
-
     /* root: абсолютный путь, не длиннее 255 символов. */
-    full = realpath(argc == 2 ? argv[1] : ".", NULL);
+    full = realpath(root_arg != NULL ? root_arg : ".", NULL);
     if (full == NULL) {
-        perror(argc == 2 ? argv[1] : ".");
+        perror(root_arg != NULL ? root_arg : ".");
         return 1;
     }
     len = strlen(full);
@@ -860,4 +861,33 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "\n[cgi_main вернула %d]\n", status);
     return status < 0 ? 1 : 0;
+}
+
+/* ======================================================================== */
+/* main() — отдать CGI-функцию серверу                                      */
+/* ======================================================================== */
+
+/*
+ *   ./example/server [ключи]    обычная работа: main() отдаёт адрес cgi_main
+ *                               библиотеке — return server_run(cgi_main, argc, argv);
+ *                               сервер сам разберёт ключи (-p, -r, ... см. -h)
+ *   ./example/server - [ROOT]   проверка CGI без сети: запрос читается из stdin
+ */
+int main(int argc, char **argv)
+{
+    /* Один минус первым аргументом — режим без сети; ROOT необязателен. */
+    if (argc > 1 && strcmp(argv[1], "-") == 0) {
+        if (argc > 3) {
+            fprintf(stderr,
+                    "Использование: %s - [ROOT] < запрос\n"
+                    "Пример: printf 'GET / HTTP/1.1\\r\\n\\r\\n' | %s - .\n",
+                    argv[0], argv[0]);
+            return 2;
+        }
+        return run_once(argc > 2 ? argv[2] : NULL);
+    }
+
+    /* Сервер — библиотека, скомпонованная с этой программой: передаём ей
+     * указатель на CGI-функцию, и на этом работа main() закончена. */
+    return server_run(cgi_main, argc, argv);
 }
