@@ -1,15 +1,23 @@
-# Makefile — сборка cgi-server и примера CGI.
+# Makefile — сборка сервера-библиотеки и примера программы.
 #
-#   make           собрать сервер и пример
-#   make server    только сервер: ./cgi-server
-#   make example   только пример CGI: example/cgi.so и example/cgi
-#   make run       собрать всё и запустить сервер с примером
+#   make           собрать библиотеку сервера и пример
+#   make server    только библиотеку сервера: ./libcgi-server.a
+#   make example   только пример: example/server
+#   make run       собрать всё и запустить пример
 #   make clean     удалить всё собранное
+#
+# Сервер здесь — не готовая программа, а БИБЛИОТЕКА для вашего main.c:
+# компоновка происходит на этапе сборки, а не во время работы (никаких
+# .so и dlopen). Своя программа собирается так:
+#
+#   make server                                # -> libcgi-server.a
+#   cc -o myserver mymain.c libcgi-server.a -pthread
 #
 # Переменные можно переопределить: make run PORT=9000 ROOT=/var/www
 # Отладочная сборка (сначала make clean):
 #   make CFLAGS="-O0 -g -fsanitize=address,undefined" LDFLAGS="-fsanitize=address,undefined"
 
+AR     ?= ar
 CFLAGS ?= -O2 -g
 WARN   := -Wall -Wextra -Wpedantic
 STD    := -std=c11
@@ -17,21 +25,15 @@ STD    := -std=c11
 ALL_CFLAGS = $(STD) $(WARN) $(CFLAGS)
 LDLIBS    += -pthread
 
-# В glibc до версии 2.34 функции dlopen()/dlsym() лежат в отдельной libdl.
-ifeq ($(shell uname -s),Linux)
-LDLIBS += -ldl
-endif
+# ---- библиотека сервера ----
+LIB     := libcgi-server.a
+LIB_SRC := server.c thread.c
+LIB_OBJ := $(LIB_SRC:.c=.o)
+DEP     := $(LIB_OBJ:.o=.d)
 
-# ---- сервер ----
-SERVER := cgi-server
-SRC    := socket.c import.c thread.c
-OBJ    := $(SRC:.c=.o)
-DEP    := $(OBJ:.o=.d)
-
-# ---- пример CGI: один файл, две сборки ----
-CGI_SRC := example/main.c
-CGI_LIB := example/cgi.so
-CGI_BIN := example/cgi
+# ---- пример: main.c, скомпонованный с библиотекой ----
+EXAMPLE_SRC := example/main.c
+EXAMPLE_BIN := example/server
 
 # ---- параметры для make run ----
 PORT ?= 8080
@@ -41,32 +43,30 @@ ROOT ?= .
 
 all: server example
 
-server: $(SERVER)
+server: $(LIB)
 
-$(SERVER): $(OBJ)
-	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+# Статическая библиотека: просто архив объектных файлов. Компоновщик
+# возьмёт из неё код сервера при сборке вашей программы — до запуска.
+$(LIB): $(LIB_OBJ)
+	$(AR) rcs $@ $^
 
 # -MMD -MP: заодно записать зависимости от .h в файл .d,
 # чтобы после правки заголовка пересобиралось всё нужное.
 %.o: %.c
 	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) -pthread -MMD -MP -c -o $@ $<
 
-example: $(CGI_LIB) $(CGI_BIN)
+example: $(EXAMPLE_BIN)
 
-# CGI как динамическая библиотека — её импортирует сервер (ключ -l).
-#   -fPIC    позиционно-независимый код (обязателен для .so)
-#   -shared  собрать разделяемую библиотеку вместо программы
-$(CGI_LIB): $(CGI_SRC) import.h
-	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) -fPIC -shared $(LDFLAGS) -o $@ $(CGI_SRC)
-
-# Тот же файл как обычная программа — работает его main().
-$(CGI_BIN): $(CGI_SRC) import.h
-	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) $(LDFLAGS) -o $@ $(CGI_SRC)
+# main.c компилируется и компонуется с libcgi-server.a за один вызов cc.
+# Библиотека стоит после исходника: компоновщик разбирает архивы слева
+# направо и берёт из них только то, что нужно уже собранным объектам.
+$(EXAMPLE_BIN): $(EXAMPLE_SRC) server.h $(LIB)
+	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) $(LDFLAGS) -o $@ $(EXAMPLE_SRC) $(LIB) $(LDLIBS)
 
 run: all
-	./$(SERVER) -p $(PORT) -r $(ROOT) -l ./$(CGI_LIB)
+	./$(EXAMPLE_BIN) -p $(PORT) -r $(ROOT)
 
 clean:
-	rm -f $(SERVER) $(OBJ) $(DEP) $(CGI_LIB) $(CGI_BIN)
+	rm -f $(LIB) $(LIB_OBJ) $(DEP) $(EXAMPLE_BIN)
 
 -include $(DEP)
