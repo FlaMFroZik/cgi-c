@@ -55,4 +55,7 @@ dkms.conf
 *.dwo
 
 # Собранные программы
-example/server
+example/fcgi-server
+
+# Файлы из тестов загрузки примера
+example/uploads/

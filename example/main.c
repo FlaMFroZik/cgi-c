@@ -1,6 +1,6 @@
 #define _XOPEN_SOURCE 700
 
-#include "../server.h"
+#include "../fcgi.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -18,14 +18,14 @@
 #include <time.h>
 #include <unistd.h>
 
-int cgi_main(char *root, char *data, size_t size, int client);
+int cgi_main(char *root, fcgi_env_t *env, char *data, size_t size,
+               fcgi_stream_t *out);
 
 
 /* ---------------- Access log (Apache/Nginx combined) ---------------- */
 
 static const char *g_access_log_path = NULL;
 static FILE       *g_access_log      = NULL;
-static size_t      g_body_bytes      = 0;
 
 static void log_init(void)
 {
@@ -48,27 +48,6 @@ static void log_close(void)
     if (g_access_log != NULL) {
         fclose(g_access_log);
         g_access_log = NULL;
-    }
-}
-
-static void get_client_ip(int fd, char *out, size_t size)
-{
-    struct sockaddr_storage ss;
-    socklen_t               len = sizeof ss;
-
-    if (size == 0)
-        return;
-    out[0] = '\0';
-
-    if (getpeername(fd, (struct sockaddr *)&ss, &len) != 0)
-        return;
-
-    if (ss.ss_family == AF_INET) {
-        struct sockaddr_in *s = (struct sockaddr_in *)&ss;
-        inet_ntop(AF_INET, &s->sin_addr, out, (socklen_t)size);
-    } else if (ss.ss_family == AF_INET6) {
-        struct sockaddr_in6 *s = (struct sockaddr_in6 *)&ss;
-        inet_ntop(AF_INET6, &s->sin6_addr, out, (socklen_t)size);
     }
 }
 
@@ -108,32 +87,35 @@ static void log_escape(const char *src, char *dst, size_t dst_size)
 }
 
 typedef struct {
-    char        method[16];
-    char        target[2048];
-    char        version[16];
+    const char *method;
+    const char *uri;
+    const char *version;
     char        path[2048];
-    char        content_type[256];
-    char        referer[2048];
-    char        user_agent[1024];
-    size_t      head_len;
+    const char *content_type;
+    const char *referer;
+    const char *user_agent;
     const char *body;
     size_t      body_len;
 } request_t;
 
-static void log_access(int fd, const request_t *req, int status)
+static void log_access(const fcgi_env_t *env, const request_t *req,
+                         int status, size_t bytes)
 {
     char      ip[64];
     char      timestamp[64];
     char      request_line[4096];
     char      referer[2048];
     char      user_agent[1024];
-    char      bytes[32];
+    char      bytes_str[32];
     time_t    now;
     struct tm tm;
 
-    get_client_ip(fd, ip, sizeof ip);
-    if (ip[0] == '\0')
-        strcpy(ip, "-");
+    /* За FastCGI-запросом стоит веб-сервер, поэтому настоящий
+     * IP клиента — в переменной REMOTE_ADDR. */
+    snprintf(ip, sizeof ip, "%s",
+             fcgi_env_get(env, "REMOTE_ADDR") != NULL
+                 ? fcgi_env_get(env, "REMOTE_ADDR")
+                 : "-");
 
     now = time(NULL);
     localtime_r(&now, &tm);
@@ -141,108 +123,78 @@ static void log_access(int fd, const request_t *req, int status)
 
     snprintf(request_line, sizeof request_line, "%s %s %s",
              req->method[0] ? req->method : "-",
-             req->target[0] ? req->target : "-",
+             req->uri[0] ? req->uri : "-",
              req->version[0] ? req->version : "-");
 
     log_escape(req->referer, referer, sizeof referer);
     log_escape(req->user_agent, user_agent, sizeof user_agent);
 
-    if (g_body_bytes > 0)
-        snprintf(bytes, sizeof bytes, "%zu", g_body_bytes);
+    if (bytes > 0)
+        snprintf(bytes_str, sizeof bytes_str, "%zu", bytes);
     else
-        strcpy(bytes, "-");
+        strcpy(bytes_str, "-");
 
     fprintf(log_stream(), "%s - - [%s] \"%s\" %d %s \"%s\" \"%s\"\n",
-            ip, timestamp, request_line, status, bytes,
+            ip, timestamp, request_line, status, bytes_str,
             referer[0] ? referer : "-",
             user_agent[0] ? user_agent : "-");
     fflush(log_stream());
 }
 
 
-/* ---------------- HTTP helpers ---------------- */
+/* ---------------- FastCGI response helpers ---------------- */
 
-static int send_all(int fd, const void *buf, size_t len)
+static int send_head(fcgi_stream_t *out, int code, const char *reason,
+                       const char *type, size_t length)
 {
-    const char *p = buf;
-
-    while (len > 0) {
-        ssize_t n = write(fd, p, len);
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        p   += n;
-        len -= (size_t)n;
-    }
-    return 0;
+    /* В FastCGI статус ответа передаётся заголовком «Status:»,
+     * а не первой строкой HTTP — веб-сервер соберёт настоящий
+     * HTTP-ответ сам. */
+    return fcgi_printf(out,
+                       "Status: %d %s\r\n"
+                       "Content-Type: %s\r\n"
+                       "Content-Length: %zu\r\n"
+                       "\r\n",
+                       code, reason, type, length);
 }
 
-static int send_body(int fd, const void *buf, size_t len)
+static int send_response(fcgi_stream_t *out, int code, const char *reason,
+                           const char *type, const char *body,
+                           size_t length, int head_only)
 {
-    int r = send_all(fd, buf, len);
-
-    if (r == 0)
-        g_body_bytes += len;
-    return r;
-}
-
-static int send_head(int fd, int code, const char *reason, const char *type, size_t length)
-{
-    char head[512];
-    int  n = snprintf(head, sizeof head,
-                      "HTTP/1.1 %d %s\r\n"
-                      "Content-Type: %s\r\n"
-                      "Content-Length: %zu\r\n"
-                      "Connection: close\r\n"
-                      "\r\n",
-                      code, reason, type, length);
-
-    if (n < 0 || (size_t)n >= sizeof head)
-        return -1;
-    return send_all(fd, head, (size_t)n);
-}
-
-static int send_response(int fd, int code, const char *reason, const char *type,
-                         const char *body, size_t length, int head_only)
-{
-    if (send_head(fd, code, reason, type, length) == 0 && !head_only)
-        send_body(fd, body, length);
+    if (send_head(out, code, reason, type, length) == 0 && !head_only)
+        fcgi_write(out, body, length);
     return code;
 }
 
-static int send_response_loc(int fd, int code, const char *reason,
-                             const char *location,
-                             const char *type,
-                             const char *body, size_t length, int head_only)
+static int send_response_loc(fcgi_stream_t *out, int code,
+                               const char *reason, const char *location,
+                               const char *type, const char *body,
+                               size_t length, int head_only)
 {
-    char head[768];
-    int  n = snprintf(head, sizeof head,
-                      "HTTP/1.1 %d %s\r\n"
-                      "Content-Type: %s\r\n"
-                      "Content-Length: %zu\r\n"
-                      "Location: %s\r\n"
-                      "Connection: close\r\n"
-                      "\r\n",
-                      code, reason, type, length, location);
+    int rc = fcgi_printf(out,
+                         "Status: %d %s\r\n"
+                         "Content-Type: %s\r\n"
+                         "Content-Length: %zu\r\n"
+                         "Location: %s\r\n"
+                         "\r\n",
+                         code, reason, type, length, location);
 
-    if (n < 0 || (size_t)n >= sizeof head)
+    if (rc != 0)
         return -1;
-    if (send_all(fd, head, (size_t)n) != 0)
-        return -1;
-    if (!head_only)
-        send_body(fd, body, length);
+    if (!head_only && length > 0)
+        fcgi_write(out, body, length);
     return code;
 }
 
-static int send_error(int fd, int code, const char *reason, int head_only)
+static int send_error(fcgi_stream_t *out, int code, const char *reason,
+                        int head_only)
 {
     char body[256];
     int  n = snprintf(body, sizeof body, "%d %s\n", code, reason);
 
-    return send_response(fd, code, reason, "text/plain; charset=utf-8",
-                         body, (size_t)n, head_only);
+    return send_response(out, code, reason, "text/plain; charset=utf-8",
+                           body, (size_t)n, head_only);
 }
 
 
@@ -277,119 +229,43 @@ static int url_decode(const char *src, size_t n, char *out, size_t out_size, int
     return 0;
 }
 
-static size_t take_word(const char *p, const char *end, char *out, size_t out_size)
+/*
+ * Запрос уже разобран веб-сервером: метод, URI и заголовки
+ * пришли в PARAMS, тело — в STDIN. Здесь только вытаскиваем
+ * нужное из окружения и раскодируем путь.
+ */
+static int fill_request(const fcgi_env_t *env, const char *data,
+                            size_t size, request_t *req)
 {
-    size_t n = 0;
-
-    while (p + n < end && p[n] != ' ' && p[n] != '\r' && p[n] != '\n')
-        n++;
-    if (n < out_size) {
-        memcpy(out, p, n);
-        out[n] = '\0';
-    } else {
-        out[0] = '\0';
-    }
-    return n;
-}
-
-static void copy_header(char *dst, size_t dst_size, const char *src, size_t src_len)
-{
-    if (src_len >= dst_size)
-        src_len = dst_size - 1;
-    memcpy(dst, src, src_len);
-    dst[src_len] = '\0';
-}
-
-static void parse_headers(const char *data, size_t head_len, request_t *req)
-{
-    const char *p   = data;
-    const char *end = data + head_len;
-
-    while (p < end && *p != '\n')
-        p++;
-    if (p < end)
-        p++;
-
-    while (p < end) {
-        const char *line_end = p;
-        const char *colon;
-
-        while (line_end < end && *line_end != '\n' && *line_end != '\r')
-            line_end++;
-        if (line_end == p)
-            break;
-
-        colon = memchr(p, ':', (size_t)(line_end - p));
-        if (colon != NULL) {
-            const char *name  = p;
-            size_t      nlen  = (size_t)(colon - p);
-            const char *value = colon + 1;
-            size_t      vlen;
-
-            while (value < line_end && (*value == ' ' || *value == '\t'))
-                value++;
-            vlen = (size_t)(line_end - value);
-
-            if (nlen == 12 && strncasecmp(name, "Content-Type", 12) == 0)
-                copy_header(req->content_type, sizeof req->content_type, value, vlen);
-            else if (nlen == 7 && strncasecmp(name, "Referer", 7) == 0)
-                copy_header(req->referer, sizeof req->referer, value, vlen);
-            else if (nlen == 10 && strncasecmp(name, "User-Agent", 10) == 0)
-                copy_header(req->user_agent, sizeof req->user_agent, value, vlen);
-        }
-
-        p = line_end;
-        if (p < end && *p == '\r') p++;
-        if (p < end && *p == '\n') p++;
-    }
-}
-
-static int parse_request(const char *data, size_t size, request_t *req)
-{
-    const char *end = data + size;
-    const char *p   = data;
+    const char *uri;
     const char *query;
-    size_t      n, i;
 
     memset(req, 0, sizeof *req);
 
-    n = take_word(p, end, req->method, sizeof req->method);
-    if (n == 0 || n >= sizeof req->method || p + n >= end || p[n] != ' ')
-        return 400;
-    p += n + 1;
+    req->method      = fcgi_env_get(env, "REQUEST_METHOD");
+    req->version     = fcgi_env_get(env, "SERVER_PROTOCOL");
+    req->content_type = fcgi_env_get(env, "CONTENT_TYPE");
+    req->referer     = fcgi_env_get(env, "HTTP_REFERER");
+    req->user_agent  = fcgi_env_get(env, "HTTP_USER_AGENT");
+    req->body        = data;
+    req->body_len    = size;
+    if (req->method == NULL) req->method = "";
+    if (req->version == NULL) req->version = "";
+    if (req->content_type == NULL) req->content_type = "";
+    if (req->referer == NULL) req->referer = "";
+    if (req->user_agent == NULL) req->user_agent = "";
 
-    n = take_word(p, end, req->target, sizeof req->target);
-    if (n >= sizeof req->target)
-        return 414;
-    if (n == 0 || req->target[0] != '/')
-        return 400;
-    p += n;
+    uri = fcgi_env_get(env, "REQUEST_URI");
+    if (uri == NULL)
+        uri = fcgi_env_get(env, "PATH_INFO");
+    if (uri == NULL)
+        uri = "/";
+    req->uri = uri;
 
-    if (p < end && *p == ' ')
-        take_word(p + 1, end, req->version, sizeof req->version);
-
-    query = strchr(req->target, '?');
-    if (url_decode(req->target, query ? (size_t)(query - req->target) : strlen(req->target),
+    query = strchr(uri, '?');
+    if (url_decode(uri, query ? (size_t)(query - uri) : strlen(uri),
         req->path, sizeof req->path, 0) != 0)
         return 400;
-
-    req->head_len = size;
-    for (i = 0; i < size; i++) {
-        if (data[i] != '\n')
-            continue;
-        if (i + 1 < size && data[i + 1] == '\n') {
-            req->head_len = i + 2;
-            break;
-        }
-        if (i + 2 < size && data[i + 1] == '\r' && data[i + 2] == '\n') {
-            req->head_len = i + 3;
-            break;
-        }
-    }
-    req->body     = data + req->head_len;
-    req->body_len = size - req->head_len;
-
-    parse_headers(data, req->head_len, req);
     return 0;
 }
 
@@ -427,21 +303,23 @@ static const char *mime_type(const char *path)
     return NULL;
 }
 
-static int serve_file(int client, int fd, const char *path, const struct stat *st, int head_only)
+static int serve_file(fcgi_stream_t *out, int fd, const char *path,
+                        const struct stat *st, int head_only)
 {
     char        chunk[64 * 1024];
     const char *type = mime_type(path);
     ssize_t     n    = read(fd, chunk, sizeof chunk);
 
     if (n < 0)
-        return send_error(client, 500, "Internal Server Error", head_only);
+        return send_error(out, 500, "Internal Server Error", head_only);
 
     if (type == NULL)
         type = memchr(chunk, 0, (size_t)n) ? "application/octet-stream"
         : "text/plain; charset=utf-8";
 
-    if (send_head(client, 200, "OK", type, (size_t)st->st_size) == 0 && !head_only) {
-        while (n > 0 && send_body(client, chunk, (size_t)n) == 0)
+    if (send_head(out, 200, "OK", type, (size_t)st->st_size) == 0 &&
+        !head_only) {
+        while (n > 0 && fcgi_write(out, chunk, (size_t)n) == 0)
             n = read(fd, chunk, sizeof chunk);
     }
     return 200;
@@ -589,7 +467,8 @@ static int url_encode(const char *src, char *dst, size_t dst_size)
 
 /* ---------------- Directory listing ---------------- */
 
-static int dir_listing(int client, const char *real, const char *path, int head_only)
+static int dir_listing(fcgi_stream_t *out, const char *real,
+                         const char *path, int head_only)
 {
     DIR           *dir;
     struct dirent *ent;
@@ -599,7 +478,7 @@ static int dir_listing(int client, const char *real, const char *path, int head_
 
     dir = opendir(real);
     if (dir == NULL)
-        return send_error(client, 403, "Forbidden", head_only);
+        return send_error(out, 403, "Forbidden", head_only);
 
     html_escape(path, title, sizeof title);
 
@@ -613,7 +492,7 @@ static int dir_listing(int client, const char *real, const char *path, int head_
         title, title) != 0) {
         closedir(dir);
     free(body.data);
-    return send_error(client, 500, "Internal Server Error", head_only);
+    return send_error(out, 500, "Internal Server Error", head_only);
         }
 
         if (strcmp(path, "/") != 0)
@@ -646,14 +525,14 @@ static int dir_listing(int client, const char *real, const char *path, int head_
             escaped, is_dir ? "/" : "") != 0) {
             closedir(dir);
         free(body.data);
-        return send_error(client, 500, "Internal Server Error", head_only);
+        return send_error(out, 500, "Internal Server Error", head_only);
             }
     }
 
     closedir(dir);
     buf_puts(&body, "</ul>\n");
 
-    ret = send_response(client, 200, "OK", "text/html; charset=utf-8",
+    ret = send_response(out, 200, "OK", "text/html; charset=utf-8",
                         body.data != NULL ? body.data : "",
                         body.len, head_only);
 
@@ -661,7 +540,8 @@ static int dir_listing(int client, const char *real, const char *path, int head_
     return ret;
 }
 
-static int serve_path(int client, const char *root, const char *path, int head_only)
+static int serve_path(fcgi_stream_t *out, const char *root,
+                        const char *path, int head_only)
 {
     char        file[4096];
     char       *real;
@@ -670,30 +550,30 @@ static int serve_path(int client, const char *root, const char *path, int head_o
     int         fd, code, inside;
 
     if (!path_is_safe(path))
-        return send_error(client, 403, "Forbidden", head_only);
+        return send_error(out, 403, "Forbidden", head_only);
 
     if (snprintf(file, sizeof file, "%s%s", root, path) >= (int)sizeof file)
-        return send_error(client, 414, "URI Too Long", head_only);
+        return send_error(out, 414, "URI Too Long", head_only);
 
     real = realpath(file, NULL);
     if (real == NULL)
-        return send_error(client, 404, "Not Found", head_only);
+        return send_error(out, 404, "Not Found", head_only);
     inside = strcmp(root, "/") == 0 ||
     (strncmp(real, root, root_len) == 0 &&
     (real[root_len] == '/' || real[root_len] == '\0'));
     if (!inside) {
         free(real);
-        return send_error(client, 403, "Forbidden", head_only);
+        return send_error(out, 403, "Forbidden", head_only);
     }
 
     fd = open(real, O_RDONLY | O_NONBLOCK);
     if (fd < 0 || fstat(fd, &st) != 0)
-        code = send_error(client, 403, "Forbidden", head_only);
+        code = send_error(out, 403, "Forbidden", head_only);
     else if (S_ISDIR(st.st_mode)) {
         if (strcmp(path, "/") == 0) {
             const char *body = "Moved to /index.html\n";
 
-            code = send_response_loc(client, 301, "Moved Permanently",
+            code = send_response_loc(out, 301, "Moved Permanently",
                                      "/index.html",
                                      "text/plain; charset=utf-8",
                                      body, strlen(body), head_only);
@@ -702,21 +582,21 @@ static int serve_path(int client, const char *root, const char *path, int head_o
             const char *body = "Moved\n";
 
             if (snprintf(loc, sizeof loc, "%s/", path) >= (int)sizeof loc) {
-                code = send_error(client, 414, "URI Too Long", head_only);
+                code = send_error(out, 414, "URI Too Long", head_only);
             } else {
-                code = send_response_loc(client, 301, "Moved Permanently",
+                code = send_response_loc(out, 301, "Moved Permanently",
                                          loc,
                                          "text/plain; charset=utf-8",
                                          body, strlen(body), head_only);
             }
         } else {
-            code = dir_listing(client, real, path, head_only);
+            code = dir_listing(out, real, path, head_only);
         }
     }
     else if (S_ISREG(st.st_mode))
-        code = serve_file(client, fd, real, &st, head_only);
+        code = serve_file(out, fd, real, &st, head_only);
     else
-        code = send_error(client, 403, "Forbidden", head_only);
+        code = send_error(out, 403, "Forbidden", head_only);
 
     if (fd >= 0)
         close(fd);
@@ -768,7 +648,7 @@ static int parse_boundary(const char *content_type, char *boundary, size_t size)
     return 0;
 }
 
-static int upload_page(int client, int head_only)
+static int upload_page(fcgi_stream_t *out, int head_only)
 {
     const char *body =
     "<!doctype html>\n"
@@ -781,7 +661,7 @@ static int upload_page(int client, int head_only)
     "</form>\n"
     "<p><a href=\"/\">Back</a></p>\n";
 
-    return send_response(client, 200, "OK", "text/html; charset=utf-8",
+    return send_response(out, 200, "OK", "text/html; charset=utf-8",
                          body, strlen(body), head_only);
 }
 
@@ -816,7 +696,8 @@ static int write_uploaded(const char *root, const char *filename,
     return 0;
 }
 
-static int save_upload_multipart(int client, const char *root, request_t *req, int head_only)
+static int save_upload_multipart(fcgi_stream_t *out, const char *root,
+                                   request_t *req, int head_only)
 {
     char        boundary[256];
     char        delim[300];
@@ -831,13 +712,13 @@ static int save_upload_multipart(int client, const char *root, request_t *req, i
     int         n;
 
     if (parse_boundary(req->content_type, boundary, sizeof boundary) != 0)
-        return send_error(client, 400, "Bad Request: missing boundary", head_only);
+        return send_error(out, 400, "Bad Request: missing boundary", head_only);
 
     delim_len = (size_t)snprintf(delim, sizeof delim, "--%s", boundary);
 
     p = mem_find(body, body_len, delim, delim_len);
     if (p == NULL)
-        return send_error(client, 400, "Bad Request: no boundary in body", head_only);
+        return send_error(out, 400, "Bad Request: no boundary in body", head_only);
     p += delim_len;
 
     if (p + 1 < body + body_len && p[0] == '\r' && p[1] == '\n')
@@ -861,7 +742,7 @@ static int save_upload_multipart(int client, const char *root, request_t *req, i
             }
     }
     if (headers_end == NULL)
-        return send_error(client, 400, "Bad Request: bad multipart headers", head_only);
+        return send_error(out, 400, "Bad Request: bad multipart headers", head_only);
 
     {
         const char *fn = mem_find(p, (size_t)(headers_end - p), "filename=\"", 10);
@@ -898,13 +779,13 @@ static int save_upload_multipart(int client, const char *root, request_t *req, i
             }
     }
     if (data_end == NULL)
-        return send_error(client, 400, "Bad Request: no data end", head_only);
+        return send_error(out, 400, "Bad Request: no data end", head_only);
 
     data_len = (size_t)(data_end - data_start);
 
     if (write_uploaded(root, filename, data_start, data_len,
         saved, sizeof saved) != 0)
-        return send_error(client, 500, "Internal Server Error: cannot save file", head_only);
+        return send_error(out, 500, "Internal Server Error: cannot save file", head_only);
 
     n = snprintf(resp, sizeof resp,
                  "<!doctype html>\n"
@@ -917,11 +798,12 @@ static int save_upload_multipart(int client, const char *root, request_t *req, i
                  "<a href=\"/\">Back</a></p>\n",
                  saved, data_len, saved);
 
-    return send_response(client, 200, "OK", "text/html; charset=utf-8",
+    return send_response(out, 200, "OK", "text/html; charset=utf-8",
                          resp, (size_t)n, head_only);
 }
 
-static int save_upload_raw(int client, const char *root, request_t *req, int head_only)
+static int save_upload_raw(fcgi_stream_t *out, const char *root,
+                             request_t *req, int head_only)
 {
     char        saved[512];
     char        resp[1024];
@@ -930,7 +812,7 @@ static int save_upload_raw(int client, const char *root, request_t *req, int hea
 
     if (write_uploaded(root, filename, req->body, req->body_len,
         saved, sizeof saved) != 0)
-        return send_error(client, 500, "Internal Server Error: cannot save file", head_only);
+        return send_error(out, 500, "Internal Server Error: cannot save file", head_only);
 
     n = snprintf(resp, sizeof resp,
                  "<!doctype html>\n"
@@ -943,21 +825,23 @@ static int save_upload_raw(int client, const char *root, request_t *req, int hea
                  "<a href=\"/\">Back</a></p>\n",
                  saved, req->body_len, saved);
 
-    return send_response(client, 200, "OK", "text/html; charset=utf-8",
+    return send_response(out, 200, "OK", "text/html; charset=utf-8",
                          resp, (size_t)n, head_only);
 }
 
-static int save_upload(int client, const char *root, request_t *req, int head_only)
+static int save_upload(fcgi_stream_t *out, const char *root,
+                         request_t *req, int head_only)
 {
     if (strncasecmp(req->content_type, "multipart/form-data", 19) == 0)
-        return save_upload_multipart(client, root, req, head_only);
-    return save_upload_raw(client, root, req, head_only);
+        return save_upload_multipart(out, root, req, head_only);
+    return save_upload_raw(out, root, req, head_only);
 }
 
 
-/* ---------------- CGI entry ---------------- */
+/* ---------------- FastCGI entry ---------------- */
 
-int cgi_main(char *root, char *data, size_t size, int client)
+int cgi_main(char *root, fcgi_env_t *env, char *data, size_t size,
+               fcgi_stream_t *out)
 {
     static int log_ready = 0;
     request_t  req;
@@ -968,35 +852,31 @@ int cgi_main(char *root, char *data, size_t size, int client)
         log_ready = 1;
     }
 
-    g_body_bytes = 0;
+    error = fill_request(env, data, size, &req);
 
-    error = parse_request(data, size, &req);
-
-    if (error == 414) {
-        status = send_error(client, 414, "URI Too Long", 0);
-    } else if (error != 0) {
-        status = send_error(client, 400, "Bad Request", 0);
+    if (error == 400) {
+        status = send_error(out, 400, "Bad Request", 0);
     } else {
         head_only = strcmp(req.method, "HEAD") == 0;
 
         if (strcmp(req.path, "/echo") == 0) {
-            status = send_response(client, 200, "OK", "text/plain; charset=utf-8",
+            status = send_response(out, 200, "OK", "text/plain; charset=utf-8",
                                    data, size, head_only);
         } else if (strcmp(req.path, "/upload") == 0) {
             if (strcmp(req.method, "POST") == 0)
-                status = save_upload(client, root, &req, 0);
+                status = save_upload(out, root, &req, 0);
             else if (strcmp(req.method, "GET") == 0 || head_only)
-                status = upload_page(client, head_only);
+                status = upload_page(out, head_only);
             else
-                status = send_error(client, 405, "Method Not Allowed", 0);
+                status = send_error(out, 405, "Method Not Allowed", 0);
         } else if (strcmp(req.method, "GET") != 0 && !head_only) {
-            status = send_error(client, 405, "Method Not Allowed", 0);
+            status = send_error(out, 405, "Method Not Allowed", 0);
         } else {
-            status = serve_path(client, root, req.path, head_only);
+            status = serve_path(out, root, req.path, head_only);
         }
     }
 
-    log_access(client, &req, status);
+    log_access(env, &req, status, fcgi_stream_bytes(out));
     return status;
 }
 
@@ -1008,70 +888,120 @@ static void usage(const char *prog)
             "\n"
             "Options:\n"
             "  -l LOGFILE   write access log in Apache/Nginx combined format\n"
-            "  -            single-shot mode: read request from stdin, write to stdout\n"
+            "  -            single-shot mode: read environment as\n"
+            "               NAME=VALUE lines (empty line ends them),\n"
+            "               then the request body from stdin;\n"
+            "               write the answer to stdout\n"
             "  ROOT         document root (default: current directory)\n"
             "\n"
             "Examples:\n"
             "  %s -l access.log /var/www\n"
-            "  printf 'GET / HTTP/1.1\\r\\n\\r\\n' | %s - .\n",
+            "  printf 'REQUEST_METHOD=GET\\nREQUEST_URI=/\\n\\n' | %s - .\n",
             prog, prog, prog, prog);
 }
 
 static int run_once(const char *root_arg)
 {
-    char           root[CGI_ROOT_SIZE];
-    cgi_function_t cgi = cgi_main;
-    char          *full, *data = NULL;
-    size_t         size = 0, cap = 0, len;
+    char           root[FCGI_ROOT_SIZE];
+    fcgi_env_t    *env;
+    fcgi_stream_t  out;
+    char          *all = NULL, *body, *p, *line_end;
+    size_t         cap = 0, len = 0, body_len;
     int            status;
 
-    full = realpath(root_arg != NULL ? root_arg : ".", NULL);
-    if (full == NULL) {
-        perror(root_arg != NULL ? root_arg : ".");
-        return 1;
-    }
-    len = strlen(full);
-    if (len >= CGI_ROOT_SIZE) {
-        fprintf(stderr, "path to directory exceeds maximum length of %d characters", CGI_ROOT_SIZE - 1);
+    {
+        char *full = realpath(root_arg != NULL ? root_arg : ".", NULL);
+        size_t plen;
+
+        if (full == NULL) {
+            perror(root_arg != NULL ? root_arg : ".");
+            return 1;
+        }
+        plen = strlen(full);
+        if (plen >= FCGI_ROOT_SIZE) {
+            fprintf(stderr, "path to directory exceeds maximum length of %d characters", FCGI_ROOT_SIZE - 1);
+            free(full);
+            return 1;
+        }
+        memset(root, 0, sizeof root);
+        memcpy(root, full, plen);
         free(full);
-        return 1;
     }
-    memset(root, 0, sizeof root);
-    memcpy(root, full, len);
-    free(full);
 
     for (;;) {
         ssize_t n;
 
-        if (size == cap) {
+        if (len == cap) {
             char *bigger;
 
             cap    = cap ? cap * 2 : 4096;
-            bigger = realloc(data, cap + 1);
+            bigger = realloc(all, cap + 1);
             if (bigger == NULL) {
                 perror("realloc");
-                free(data);
+                free(all);
                 return 1;
             }
-            data = bigger;
+            all = bigger;
         }
-        n = read(STDIN_FILENO, data + size, cap - size);
+        n = read(STDIN_FILENO, all + len, cap - len);
         if (n < 0 && errno == EINTR)
             continue;
         if (n < 0) {
             perror("stdin");
-            free(data);
+            free(all);
             return 1;
         }
         if (n == 0)
             break;
-        size += (size_t)n;
+        len += (size_t)n;
     }
-    data[size] = '\0';
+    all[len] = '\0';
 
-    status = cgi(root, data, size, STDOUT_FILENO);
-    free(data);
+    /* Окружение: строки NAME=VALUE, конец — пустая строка.
+     * Разбираем «на месте»: терминаторы превращаем в '\0'. */
+    env = fcgi_env_create();
+    if (env == NULL) {
+        free(all);
+        return 1;
+    }
+    p = all;
+    while (p < all + len) {
+        char *eq;
+        size_t line_len;
 
+        line_end = memchr(p, '\n', (size_t)(all + len - p));
+        line_len = line_end != NULL ? (size_t)(line_end - p)
+                                    : (size_t)(all + len - p);
+        if (line_len == 0 || (line_len == 1 && p[0] == '\r')) {
+            p = line_end != NULL ? line_end + 1 : all + len;
+            break; /* пустая строка: дальше — тело */
+        }
+        eq = memchr(p, '=', line_len);
+        if (eq != NULL) {
+            *eq = '\0';
+            if (line_end != NULL) {
+                if (line_end > p && line_end[-1] == '\r')
+                    line_end[-1] = '\0';
+                *line_end = '\0';
+            }
+            fcgi_env_add(env, p, eq + 1);
+        }
+        p = line_end != NULL ? line_end + 1 : all + len;
+    }
+    body = p;
+    body_len = (size_t)(all + len - p);
+
+    /* Режим отладки: ответ — «голые» байты на stdout, без
+     * записей FastCGI (так его удобно читать глазами). */
+    out.fd         = STDOUT_FILENO;
+    out.request_id = 0;
+    out.framed     = 0;
+    out.written    = 0;
+
+    status = cgi_main(root, env, body, body_len, &out);
+
+    fcgi_env_free(env);
+    free(all);
     log_close();
     return status < 0 ? 1 : 0;
 }
@@ -1106,5 +1036,5 @@ int main(int argc, char **argv)
         return run_once(fargc > 2 ? filtered[2] : NULL);
     }
 
-    return server_run(cgi_main, fargc, filtered);
+    return fcgi_run(cgi_main, fargc, filtered);
 }
