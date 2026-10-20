@@ -127,6 +127,12 @@ typedef struct {
     size_t params_len, params_cap;
     char  *body;        /* копилка для STDIN (тело запроса) */
     size_t body_len, body_cap;
+
+    /* CONTENT_LENGTH из PARAMS — чтобы не ждать завершающую
+     * пустую запись STDIN, если тело уже получено целиком
+     * (некоторые клиенты её не присылают). */
+    int    content_length_set;
+    size_t content_length;
 } conn_t;
 
 /* ======================================================================== */
@@ -152,6 +158,8 @@ static int send_all(int fd, const char *buf, size_t len)
                 continue;
             return -1;
         }
+        if (n == 0) /* не должно случаться, но иначе — вечный цикл */
+            return -1;
         buf += n;
         len -= (size_t)n;
     }
@@ -169,6 +177,8 @@ static int write_all(int fd, const char *buf, size_t len)
                 continue;
             return -1;
         }
+        if (n == 0)
+            return -1;
         buf += n;
         len -= (size_t)n;
     }
@@ -193,34 +203,44 @@ static int read_full(int fd, char *buf, size_t len)
     return 0;
 }
 
-/* Дописать в растущий буфер. Возвращает 0 или -1 (нет памяти). */
+/*
+ * Дописать в растущий буфер. Возвращает 0 или -1 (нет памяти).
+ *
+ * В буфере всегда остаётся место под завершающий '\0', и он
+ * выставляется после последнего байта: приложение получает тело
+ * запроса (data) как обычную C-строку, даже если в нём есть
+ * нулевые байты (размер при этом передаётся отдельно).
+ */
 static int buf_grow(char **buf, size_t *len, size_t *cap,
                       const char *data, size_t add)
 {
-    size_t need = *len + add;
+    size_t need;
     size_t ncap;
     char  *p;
 
     if (add == 0)
         return 0;
-    if (need <= *cap)
-        goto copy;
-
-    ncap = *cap ? *cap : 4096;
-    while (ncap < need) {
-        if (ncap > SIZE_MAX / 2)
-            return -1;
-        ncap *= 2;
-    }
-    p = realloc(*buf, ncap);
-    if (p == NULL)
+    if (*len > SIZE_MAX - add - 1) /* +1 — место под '\0' */
         return -1;
-    *buf = p;
-    *cap = ncap;
+    need = *len + add;
 
-copy:
+    if (need + 1 > *cap) {
+        ncap = *cap ? *cap : 4096;
+        while (ncap < need + 1) {
+            if (ncap > SIZE_MAX / 2)
+                return -1;
+            ncap *= 2;
+        }
+        p = realloc(*buf, ncap);
+        if (p == NULL)
+            return -1;
+        *buf = p;
+        *cap = ncap;
+    }
+
     memcpy(*buf + *len, data, add);
     *len = need;
+    (*buf)[need] = '\0';
     return 0;
 }
 
@@ -369,7 +389,8 @@ static void answer_get_values(int fd, const char *content, size_t len,
         if (nlen == SIZE_MAX)
             break;
         vlen = read_length(content, len, &pos);
-        if (vlen == SIZE_MAX || pos + nlen + vlen > len)
+        if (vlen == SIZE_MAX || nlen > len - pos ||
+            vlen > len - pos - nlen)
             break;
         name = content + pos;
         pos += nlen + vlen; /* само значение нам не нужно */
@@ -467,6 +488,8 @@ static int fcgi_env_add_n(fcgi_env_t *env, const char *name,
 
 int fcgi_env_add(fcgi_env_t *env, const char *name, const char *value)
 {
+    if (env == NULL || name == NULL || value == NULL)
+        return -1;
     return fcgi_env_add_n(env, name, strlen(name), value, strlen(value));
 }
 
@@ -508,7 +531,8 @@ static int parse_params(const char *buf, size_t len, fcgi_env_t *env)
         if (nlen == SIZE_MAX)
             return -1;
         vlen = read_length(buf, len, &pos);
-        if (vlen == SIZE_MAX || pos + nlen + vlen > len)
+        if (vlen == SIZE_MAX || nlen > len - pos ||
+            vlen > len - pos - nlen)
             return -1;
         if (fcgi_env_add_n(env, buf + pos, nlen, buf + pos + nlen,
                                vlen) != 0)
@@ -548,18 +572,40 @@ int fcgi_write_err(fcgi_stream_t *out, const char *buf, size_t len)
 
 int fcgi_printf(fcgi_stream_t *out, const char *fmt, ...)
 {
-    char    buf[4096];
-    va_list ap;
-    int     n;
+    char    small[512];
+    char   *buf = small;
+    size_t  size;
+    va_list ap, ap2;
+    int     n, rc;
 
     va_start(ap, fmt);
-    n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_copy(ap2, ap);
+    n = vsnprintf(small, sizeof small, fmt, ap);
     va_end(ap);
-    if (n < 0)
+    if (n < 0) {
+        va_end(ap2);
         return -1;
-    if ((size_t)n > sizeof buf - 1) /* слишком длинная — обрежем */
-        n = (int)sizeof buf - 1;
-    return fcgi_write(out, buf, (size_t)n);
+    }
+
+    if ((size_t)n < sizeof small) {
+        size = (size_t)n;
+    } else {
+        /* Строка не влезла в стековый буфер — выделяем ровно
+         * столько, сколько нужно. Ответ не обрезается. */
+        size = (size_t)n;
+        buf  = malloc(size + 1);
+        if (buf == NULL) {
+            va_end(ap2);
+            return -1;
+        }
+        vsnprintf(buf, size + 1, fmt, ap2);
+    }
+    va_end(ap2);
+
+    rc = fcgi_write(out, buf, size);
+    if (buf != small)
+        free(buf);
+    return rc;
 }
 
 size_t fcgi_stream_bytes(const fcgi_stream_t *out)
@@ -647,6 +693,82 @@ static void log_request(const char *addr, const fcgi_env_t *env,
            (double)elapsed_us / 1000.0);
 }
 
+/* Тело без STDIN-записей: приложению всё равно нужен не NULL,
+ * а годный для чтения буфер с завершающим '\0'. */
+static int ensure_body(conn_t *c)
+{
+    if (c->body == NULL) {
+        c->body = malloc(1);
+        if (c->body == NULL)
+            return -1;
+        c->body[0]  = '\0';
+        c->body_cap = 1;
+        c->body_len = 0;
+    } else {
+        /* buf_grow() держит место под завершающий '\0'. */
+        c->body[c->body_len] = '\0';
+    }
+    return 0;
+}
+
+/*
+ * Найти CONTENT_LENGTH среди переменных PARAMS. Если он есть и
+ * корректен, запрос можно считать полученным, как только в теле
+ * набралось столько байт, — не дожидаясь пустой записи STDIN,
+ * которую присылают не все клиенты.
+ */
+static void scan_content_length(conn_t *c)
+{
+    size_t pos = 0;
+
+    c->content_length_set = 0;
+    c->content_length     = 0;
+
+    while (pos < c->params_len) {
+        size_t      nlen = read_length(c->params, c->params_len, &pos);
+        size_t      vlen;
+        const char *text;
+        size_t      value = 0;
+        size_t      i;
+
+        if (nlen == SIZE_MAX)
+            return;
+        vlen = read_length(c->params, c->params_len, &pos);
+        if (vlen == SIZE_MAX || nlen > c->params_len - pos ||
+            vlen > c->params_len - pos - nlen)
+            return;
+
+        if (nlen == 14 &&
+            memcmp(c->params + pos, "CONTENT_LENGTH", 14) == 0) {
+            text = c->params + pos + nlen;
+            for (i = 0; i < vlen; i++) {
+                size_t digit = (size_t)((unsigned char)text[i] - '0');
+
+                if ((unsigned char)text[i] < '0' ||
+                    (unsigned char)text[i] > '9' ||
+                    value > (SIZE_MAX - digit) / 10)
+                    break;
+                value = value * 10 + digit;
+            }
+            if (i == vlen) {
+                c->content_length     = value;
+                c->content_length_set = 1;
+            }
+        }
+        pos += nlen + vlen;
+    }
+}
+
+/* Запрос получен целиком? */
+static int request_complete(const conn_t *c)
+{
+    if (c->request_id == 0 || !c->params_done)
+        return 0;
+    if (c->stdin_done)
+        return 1;
+    return c->content_length_set && c->body_len >= c->content_length;
+}
+
 /*
  * Собрать запрос (env + тело) и вызвать приложение, затем отправить
  * END_REQUEST. Ответ приложения уходит в STDOUT сразу, порциями —
@@ -669,7 +791,8 @@ static void process_request(server_t *server, conn_t *c)
      * буфер, никак не влияя на другие потоки. */
     memcpy(root, server->root, FCGI_ROOT_SIZE);
 
-    if (env == NULL || parse_params(c->params, c->params_len, env) != 0) {
+    if (env == NULL || parse_params(c->params, c->params_len, env) != 0 ||
+        ensure_body(c) != 0) {
         send_fallback(&out, 500, "Internal Server Error");
         status = 500;
     } else {
@@ -681,6 +804,20 @@ static void process_request(server_t *server, conn_t *c)
         if (status < 0) { /* приложение: ответ не отправлен */
             if (out.written == 0)
                 send_fallback(&out, 500, "Internal Server Error");
+            status = 500;
+        } else if (out.written == 0) {
+            /*
+             * Приложение вернуло «успех», но не написало ни байта.
+             * Пустой STDOUT веб-сервер примет за ошибку (nginx —
+             * «upstream sent no valid HTTP/1.0 header»), а клиент
+             * получит пустой ответ. Поэтому отвечаем сами.
+             */
+            static const char warn[] =
+                "fcgi: обработчик не отправил ответ — "
+                "библиотека посылает 500\n";
+
+            fcgi_write_err(&out, warn, sizeof warn - 1);
+            send_fallback(&out, 500, "Internal Server Error");
             status = 500;
         }
     }
@@ -761,7 +898,7 @@ static void fcgi_connection(int client, void *arg)
     deadline = now_us() + (long long)server->timeout_ms * 1000;
 
     while (!stop) {
-        unsigned char head[FCGI_HEADER_SIZE];
+        unsigned char head[FCGI_HEADER_SIZE] = {0};
         char         *content = NULL;
         int           type, request_id, content_len, padding;
         int           overflow = 0; /* код отказа: 413 или 431 */
@@ -782,7 +919,9 @@ static void fcgi_connection(int client, void *arg)
 
         /* 2. Данные записи (padding отбрасываем). */
         if (content_len > 0) {
-            content = malloc((size_t)content_len);
+            /* calloc: даже при странном содержимом записи в буфере
+             * не окажется неинициализированных байт. */
+            content = calloc(1, (size_t)content_len);
             if (content == NULL)
                 break;
             if (read_full(client, content, (size_t)content_len) != 0) {
@@ -811,12 +950,17 @@ static void fcgi_connection(int client, void *arg)
             role  = ((int)content[0] << 8) | content[1];
             flags = content[2];
 
-            if (c.request_id != 0 && request_id != c.request_id) {
-                /* Мультиплексирование не поддерживаем: сообщаем и
-                 * закрываем соединение. */
-                send_end(client, request_id, 0, FCGI_CANT_MPX_CONN);
-                stop = 1;
-                break;
+            if (c.request_id != 0) {
+                if (request_id != c.request_id) {
+                    /* Мультиплексирование не поддерживаем: сообщаем и
+                     * закрываем соединение. */
+                    send_end(client, request_id, 0, FCGI_CANT_MPX_CONN);
+                    stop = 1;
+                    break;
+                }
+                /* Повторный BEGIN того же запроса: начинаем заново,
+                 * чтобы в новый запрос не попали старые PARAMS/STDIN. */
+                conn_reset(&c);
             }
 
             keep             = (flags & FCGI_KEEP_CONN) != 0;
@@ -836,17 +980,34 @@ static void fcgi_connection(int client, void *arg)
         }
 
         case FCGI_ABORT_REQUEST:
-            /* Веб-сервер передумал: выбрасываем накопленное. */
+            /* Веб-сервер передумал: выбрасываем накопленное и
+             * завершаем запрос по протоколу. Запрос с другим
+             * номером не трогаем. */
+            if (c.request_id != 0 && request_id != c.request_id)
+                break;
+            if (c.request_id != 0)
+                send_end(client, c.request_id, 0, FCGI_REQUEST_COMPLETE);
             conn_reset(&c);
+            deadline = now_us() + (long long)server->timeout_ms * 1000;
             break;
 
         case FCGI_PARAMS:
-            if (request_id != c.request_id || c.request_id == 0) {
+            if (c.request_id == 0) {
+                /* Пустая запись, запоздавшая после ответа на прошлый
+                 * запрос (мы могли не ждать её, зная CONTENT_LENGTH),
+                 * — не ошибка. Данные без запроса — уже ошибка. */
+                if (content_len == 0)
+                    break;
+                stop = 1;
+                break;
+            }
+            if (request_id != c.request_id) {
                 stop = 1;
                 break;
             }
             if (content_len == 0) {
                 c.params_done = 1; /* конец потока PARAMS */
+                scan_content_length(&c);
                 break;
             }
             if (buf_grow(&c.params, &c.params_len, &c.params_cap,
@@ -861,7 +1022,14 @@ static void fcgi_connection(int client, void *arg)
             break;
 
         case FCGI_STDIN:
-            if (request_id != c.request_id || c.request_id == 0) {
+            if (c.request_id == 0) {
+                /* запоздавшая завершающая запись прошлого запроса */
+                if (content_len == 0)
+                    break;
+                stop = 1;
+                break;
+            }
+            if (request_id != c.request_id) {
                 stop = 1;
                 break;
             }
@@ -897,11 +1065,13 @@ static void fcgi_connection(int client, void *arg)
         default: {
             /* Неизвестный тип — отвечаем по протоколу и живём
              * дальше. */
-            unsigned char unknown[1];
+            unsigned char unknown[8];
 
+            /* содержимое FCGI_UNKNOWN_TYPE: тип + 7 зарезервированных */
+            memset(unknown, 0, sizeof unknown);
             unknown[0] = (unsigned char)type;
             rec_send(client, FCGI_UNKNOWN_TYPE, 0,
-                       (const char *)unknown, 1);
+                       (const char *)unknown, sizeof unknown);
             break;
         }
         }
@@ -927,12 +1097,14 @@ static void fcgi_connection(int client, void *arg)
         }
 
         /* 5. Запрос целиком получен — обрабатываем. */
-        if (c.request_id != 0 && c.params_done && c.stdin_done) {
+        if (request_complete(&c)) {
             int keep;
 
             process_request(server, &c);
             keep = c.keep_conn;
             conn_reset(&c);
+            /* keep-alive: следующий запрос получает свой срок. */
+            deadline = now_us() + (long long)server->timeout_ms * 1000;
             if (!keep)
                 stop = 1;
         }

@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,8 +27,13 @@ int cgi_main(char *root, fcgi_env_t *env, char *data, size_t size,
 
 static const char *g_access_log_path = NULL;
 static FILE       *g_access_log      = NULL;
+static pthread_once_t g_log_once     = PTHREAD_ONCE_INIT;
 
-static void log_init(void)
+static void log_close(void);
+
+/* Открыть журнал один раз, даже если первые запросы пришли
+ * одновременно в разные потоки. */
+static void log_init_once(void)
 {
     const char *path = g_access_log_path;
 
@@ -35,6 +41,8 @@ static void log_init(void)
         g_access_log = fopen(path, "a");
         if (g_access_log == NULL)
             perror(path);
+        else
+            atexit(log_close); /* закрыть и при обычном выходе */
     }
 }
 
@@ -477,8 +485,16 @@ static int dir_listing(fcgi_stream_t *out, const char *real,
     int            ret;
 
     dir = opendir(real);
-    if (dir == NULL)
-        return send_error(out, 403, "Forbidden", head_only);
+    if (dir == NULL) {
+        int saved = errno;
+
+        return send_error(out, saved == ENOENT ? 404 :
+                               saved == EACCES ? 403 : 500,
+                          saved == ENOENT ? "Not Found" :
+                          saved == EACCES ? "Forbidden"
+                                          : "Internal Server Error",
+                          head_only);
+    }
 
     html_escape(path, title, sizeof title);
 
@@ -489,14 +505,12 @@ static int dir_listing(fcgi_stream_t *out, const char *real,
         "<h1>Index of %s</h1>\n"
         "<p><a href=\"/upload\">Upload a file</a></p>\n"
         "<ul>\n",
-        title, title) != 0) {
-        closedir(dir);
-    free(body.data);
-    return send_error(out, 500, "Internal Server Error", head_only);
-        }
+        title, title) != 0)
+        goto fail;
 
-        if (strcmp(path, "/") != 0)
-            buf_puts(&body, "<li><a href=\"../\">../</a></li>\n");
+    if (strcmp(path, "/") != 0 &&
+        buf_puts(&body, "<li><a href=\"../\">../</a></li>\n") != 0)
+        goto fail;
 
     while ((ent = readdir(dir)) != NULL) {
         char        full[4096];
@@ -505,10 +519,12 @@ static int dir_listing(fcgi_stream_t *out, const char *real,
         struct stat st;
         int         is_dir = 0;
 
-        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+        if (strcmp(ent->d_name, ".") == 0 ||
+            strcmp(ent->d_name, "..") == 0)
             continue;
 
-        if (snprintf(full, sizeof full, "%s/%s", real, ent->d_name) >= (int)sizeof full)
+        if (snprintf(full, sizeof full, "%s/%s", real, ent->d_name) >=
+            (int)sizeof full)
             continue;
 
         if (stat(full, &st) == 0 && S_ISDIR(st.st_mode))
@@ -522,22 +538,59 @@ static int dir_listing(fcgi_stream_t *out, const char *real,
         if (buf_printf(&body,
             "<li><a href=\"%s%s\">%s%s</a></li>\n",
             encoded, is_dir ? "/" : "",
-            escaped, is_dir ? "/" : "") != 0) {
-            closedir(dir);
-        free(body.data);
-        return send_error(out, 500, "Internal Server Error", head_only);
-            }
+            escaped, is_dir ? "/" : "") != 0)
+            goto fail;
     }
 
+    if (buf_puts(&body, "</ul>\n") != 0)
+        goto fail;
+
     closedir(dir);
-    buf_puts(&body, "</ul>\n");
-
+    /* body.data не NULL: первый buf_printf уже выделил буфер. */
     ret = send_response(out, 200, "OK", "text/html; charset=utf-8",
-                        body.data != NULL ? body.data : "",
-                        body.len, head_only);
-
+                        body.data, body.len, head_only);
     free(body.data);
     return ret;
+
+fail:
+    closedir(dir);
+    free(body.data);
+    return send_error(out, 500, "Internal Server Error", head_only);
+}
+
+static int serve_index(fcgi_stream_t *out, const char *dir, const char *path,
+                         int head_only)
+{
+    char        index[4096];
+    struct stat st;
+    int         fd, code;
+
+    if (strcmp(dir, "/") == 0) {
+        if (snprintf(index, sizeof index, "/index.html") >=
+            (int)sizeof index)
+            return dir_listing(out, dir, path, head_only);
+    } else if (snprintf(index, sizeof index, "%s/index.html", dir) >=
+               (int)sizeof index) {
+        return dir_listing(out, dir, path, head_only);
+    }
+
+    fd = open(index, O_RDONLY);
+    if (fd < 0) {
+        if (errno == ENOENT || errno == ENOTDIR || errno == EISDIR)
+            return dir_listing(out, dir, path, head_only);
+        return send_error(out, errno == EACCES ? 403 : 500,
+                          errno == EACCES ? "Forbidden"
+                                          : "Internal Server Error",
+                          head_only);
+    }
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return dir_listing(out, dir, path, head_only);
+    }
+
+    code = serve_file(out, fd, index, &st, head_only);
+    close(fd);
+    return code;
 }
 
 static int serve_path(fcgi_stream_t *out, const char *root,
@@ -566,18 +619,23 @@ static int serve_path(fcgi_stream_t *out, const char *root,
         return send_error(out, 403, "Forbidden", head_only);
     }
 
-    fd = open(real, O_RDONLY | O_NONBLOCK);
-    if (fd < 0 || fstat(fd, &st) != 0)
-        code = send_error(out, 403, "Forbidden", head_only);
-    else if (S_ISDIR(st.st_mode)) {
-        if (strcmp(path, "/") == 0) {
-            const char *body = "Moved to /index.html\n";
+    fd = open(real, O_RDONLY);
+    if (fd < 0) {
+        int saved = errno;
 
-            code = send_response_loc(out, 301, "Moved Permanently",
-                                     "/index.html",
-                                     "text/plain; charset=utf-8",
-                                     body, strlen(body), head_only);
-        } else if (path[strlen(path) - 1] != '/') {
+        /* Файл исчез между realpath() и open() — это 404, а не
+         * 403, как было раньше; нет прав — 403; остальное — 500. */
+        code = send_error(out,
+                          saved == ENOENT || saved == ENOTDIR ? 404 :
+                          saved == EACCES ? 403 : 500,
+                          saved == ENOENT || saved == ENOTDIR ? "Not Found" :
+                          saved == EACCES ? "Forbidden"
+                                          : "Internal Server Error",
+                          head_only);
+    } else if (fstat(fd, &st) != 0) {
+        code = send_error(out, 500, "Internal Server Error", head_only);
+    } else if (S_ISDIR(st.st_mode)) {
+        if (path[strlen(path) - 1] != '/') {
             char        loc[4096];
             const char *body = "Moved\n";
 
@@ -590,7 +648,7 @@ static int serve_path(fcgi_stream_t *out, const char *root,
                                          body, strlen(body), head_only);
             }
         } else {
-            code = dir_listing(out, real, path, head_only);
+            code = serve_index(out, real, path, head_only);
         }
     }
     else if (S_ISREG(st.st_mode))
@@ -685,9 +743,24 @@ static int write_uploaded(const char *root, const char *filename,
     if (fd < 0)
         return -1;
 
-    if (len > 0 && write(fd, data, len) != (ssize_t)len) {
-        close(fd);
-        return -1;
+    /* write() может записать меньше, чем попросили, — доисываем. */
+    while (len > 0) {
+        ssize_t n = write(fd, data, len);
+
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            close(fd);
+            unlink(full);
+            return -1;
+        }
+        if (n == 0) {
+            close(fd);
+            unlink(full);
+            return -1;
+        }
+        data += (size_t)n;
+        len  -= (size_t)n;
     }
     close(fd);
 
@@ -762,7 +835,8 @@ static int save_upload_multipart(fcgi_stream_t *out, const char *root,
                     filename[j++] = c;
                 }
                 filename[j] = '\0';
-                if (j == 0)
+                if (j == 0 || strcmp(filename, ".") == 0 ||
+                    strcmp(filename, "..") == 0)
                     strcpy(filename, "upload.bin");
             }
         }
@@ -843,14 +917,10 @@ static int save_upload(fcgi_stream_t *out, const char *root,
 int cgi_main(char *root, fcgi_env_t *env, char *data, size_t size,
                fcgi_stream_t *out)
 {
-    static int log_ready = 0;
     request_t  req;
     int        head_only, error, status = 0;
 
-    if (!log_ready) {
-        log_init();
-        log_ready = 1;
-    }
+    pthread_once(&g_log_once, log_init_once);
 
     error = fill_request(env, data, size, &req);
 
@@ -860,8 +930,21 @@ int cgi_main(char *root, fcgi_env_t *env, char *data, size_t size,
         head_only = strcmp(req.method, "HEAD") == 0;
 
         if (strcmp(req.path, "/echo") == 0) {
-            status = send_response(out, 200, "OK", "text/plain; charset=utf-8",
-                                   data, size, head_only);
+            if (size == 0) {
+                /* Пустой ответ ничего не говорит клиенту: браузер
+                 * покажет пустую страницу. Отвечаем пояснением. */
+                static const char empty_body[] =
+                    "(request body is empty)\n";
+
+                status = send_response(out, 200, "OK",
+                                       "text/plain; charset=utf-8",
+                                       empty_body, sizeof empty_body - 1,
+                                       head_only);
+            } else {
+                status = send_response(out, 200, "OK",
+                                       "text/plain; charset=utf-8",
+                                       data, size, head_only);
+            }
         } else if (strcmp(req.path, "/upload") == 0) {
             if (strcmp(req.method, "POST") == 0)
                 status = save_upload(out, root, &req, 0);

@@ -56,6 +56,8 @@ dkms.conf
 
 # Собранные программы
 example/fcgi-server
+tests/emptyapp
+tests/contractapp
 
 # Файлы из тестов загрузки примера
 example/uploads/
