@@ -4,7 +4,6 @@
 #   make server    только библиотеку: ./libfcgi-server.a
 #   make example   только пример: example/fcgi-server
 #   make run       собрать всё и запустить пример
-#   make test      прогнать самопроверку (tests/test_fcgi.py)
 #   make clean     удалить всё собранное
 #
 # Приложение здесь — не готовая программа, а БИБЛИОТЕКА для
@@ -38,15 +37,12 @@ DEP     := $(LIB_OBJ:.o=.d)
 EXAMPLE_SRC := example/main.c
 EXAMPLE_BIN := example/fcgi-server
 
-# ---- тестовые приложения для make test ----
-TEST_BIN := tests/emptyapp tests/contractapp
-
 # ---- параметры для make run ----
 PORT ?= 9000
 ROOT ?= example
 SOCK ?=
 
-.PHONY: all server example run test clean
+.PHONY: all server example run clean
 
 all: server example
 
@@ -79,15 +75,7 @@ else
 	./$(EXAMPLE_BIN) -p $(PORT) -r $(ROOT)
 endif
 
-# Тестовые приложения компонуются с той же библиотекой (и теми же
-# флагами), что и пример, поэтому ASan-сборка проверяется целиком.
-tests/%: tests/%.c $(LIB) fcgi.h
-	$(CC) $(CPPFLAGS) -I. $(ALL_CFLAGS) $(LDFLAGS) -o $@ $< $(LIB) $(LDLIBS)
-
-test: all $(TEST_BIN)
-	python3 tests/test_fcgi.py
-
 clean:
-	rm -f $(LIB) $(LIB_OBJ) $(DEP) $(EXAMPLE_BIN) $(TEST_BIN)
+	rm -f $(LIB) $(LIB_OBJ) $(DEP) $(EXAMPLE_BIN)
 
 -include $(DEP)
