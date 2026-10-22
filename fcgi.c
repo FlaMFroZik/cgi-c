@@ -824,7 +824,7 @@ static void process_request(server_t *server, conn_t *c)
 
     /* Конец потока STDOUT — пустая запись, затем END_REQUEST. */
     rec_send(c->fd, FCGI_STDOUT, c->request_id, NULL, 0);
-    send_end(c->fd, c->request_id, status > 0 ? status : 0,
+    send_end(c->fd, c->request_id, status >= 0 ? status : 0,
                FCGI_REQUEST_COMPLETE);
 
     if (!server->quiet) {

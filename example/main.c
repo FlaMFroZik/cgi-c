@@ -847,10 +847,10 @@ static int save_upload_multipart(fcgi_stream_t *out, const char *root,
         if ((q == data_start || q[-1] == '\n') &&
             memcmp(q, delim, delim_len) == 0) {
             data_end = q;
-        if (data_end > data_start && data_end[-1] == '\n') data_end--;
-        if (data_end > data_start && data_end[-1] == '\r') data_end--;
-        break;
-            }
+            if (data_end > data_start && data_end[-1] == '\n') data_end--;
+            if (data_end > data_start && data_end[-1] == '\r') data_end--;
+            break;
+        }
     }
     if (data_end == NULL)
         return send_error(out, 400, "Bad Request: no data end", head_only);
